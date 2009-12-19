@@ -114,7 +114,7 @@ class Handler(socketserver.StreamRequestHandler):
                 if product.upper() != "VESTIBULE" or r is None:
                     self.send("501 SYNTAX")
                     continue
-                if r != MAX_REVISION:
+                if r > MAX_REVISION:
                     # Deliberately silent about which revision it wants.
                     self.send("505 PROTOCOL REVISION NOT SUPPORTED")
                     rev = None
