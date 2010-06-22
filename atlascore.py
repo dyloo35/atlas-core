@@ -263,8 +263,8 @@ class Handler(socketserver.StreamRequestHandler):
             self.send("501 SYNTAX")
             return
         sid, number = parts[1], parts[2].upper()
-        if not POLICY_RE.match(number):
-            self.send("552 POLICY NUMBER MALFORMED")
+        if not policy_ok(number, data["criteria"]):
+            self.send("552 POLICY NUMBER NOT ISSUABLE AGAINST THIS FILE")
             return
 
         with _lock:
@@ -320,7 +320,17 @@ class Handler(socketserver.StreamRequestHandler):
         self.send("404 NO SUCH RECORD")
 
 
-POLICY_RE = re.compile(r"^ALD-[A-H]-\d{5}$")
+def policy_ok(number, crit):
+    """One number, and only one, will be accepted for a given file.
+
+    The register does not take any policy number. A mid-term admission is
+    written against the Society's own reserve block, and the block runs on a
+    single number. Neither the letter nor the number is written here. The
+    letter came with the schedule. The number did not come with anything, and
+    I have carried it about with me for long enough.
+    -- dyloo35
+    """
+    return number == "ALD-%s-%s" % (crit["reserve"], crit["number"])
 
 
 def save(data, creds):
