@@ -23,13 +23,14 @@ them, which on reflection probably suited everybody.
 
 import hmac
 import json
+import re
 import os
 import socketserver
 import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from crypt import account_hash, derive, unseal
+from crypt import account_hash, derive, seal, unseal
 
 ARCHIVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive.dat")
 
@@ -72,6 +73,47 @@ def parse_rev(s):
         return None
 
 
+# The register does not hold a cost or a classification. It holds what the
+# committee entered -- an annual figure and a loading -- and works the rest out
+# each time it is asked. I did not choose that; it is what the service does.
+#
+# The numbers the sum needs are not in this file and I am not going to put them
+# here. They came on paper, and whoever holds the paper can check my arithmetic.
+# -- dyloo35
+
+
+def loading(row, crit):
+    return row["base_loading"] + (crit["dependant"] if not row["policy"] else 0)
+
+
+def exposure(row, crit):
+    return row["annual"] * crit["term"] * (100 + loading(row, crit)) // 100
+
+
+def classify(row, crit):
+    if row.get("outcome"):
+        return row["outcome"]
+    if row.get("investigation"):
+        return "on watch"
+    return ("to be eliminated" if exposure(row, crit) >= crit["threshold"]
+            else "safe")
+
+
+def view(row, crit):
+    """The row as the register presents it: what is stored, plus what is worked
+    out from it."""
+    if "annual" not in row:
+        return row
+    out = dict(row)
+    out["term"] = crit["term"]
+    out["loading"] = loading(row, crit)
+    out["cost"] = exposure(row, crit)
+    out["danger"] = classify(row, crit)
+    for k in ("base_loading", "investigation", "outcome"):
+        out.pop(k, None)
+    return out
+
+
 def load(creds):
     """Decrypt the archive. Cached -- scrypt on every request, no."""
     with _lock:
@@ -91,6 +133,7 @@ class Handler(socketserver.StreamRequestHandler):
     def handle(self):
         rev = None
         data = None
+        creds = None
         self.send("220 ATLAS-CORE")
         while True:
             raw = self.rfile.readline()
@@ -151,9 +194,10 @@ class Handler(socketserver.StreamRequestHandler):
                     self.send("501 SYNTAX")
                     continue
                 try:
-                    data = load(tuple(parts[1:]))
+                    creds = tuple(parts[1:])
+                    data = load(creds)
                 except Exception:
-                    data = None
+                    data = creds = None
                     self.send("535 REJECTED")
                     continue
                 self.send("235 AUTHENTICATED")
@@ -167,6 +211,8 @@ class Handler(socketserver.StreamRequestHandler):
                 self.do_list(parts, rev, data)
             elif cmd == "GET":
                 self.do_get(parts, rev, data)
+            elif cmd == "POLICY":
+                self.do_policy(parts, rev, data, creds)
             else:
                 self.send("500 UNKNOWN COMMAND")
 
@@ -193,11 +239,67 @@ class Handler(socketserver.StreamRequestHandler):
             self.send("501 SYNTAX")
             return
 
-        page = rows[off:off + cnt]
+        crit = data["criteria"]
+        page = [view(r, crit) for r in rows[off:off + cnt]]
         self.send("250 %d %d" % (len(page), len(rows)))
         self.send("\t".join(keys))
         for row in page:
             self.send("\t".join(str(row.get(k, "")) for k in keys))
+        self.send(".")
+
+    def do_policy(self, parts, rev, data, creds):
+        """POLICY <subject id> <policy number> -- record a policy in force.
+
+        The one thing this service will write. It does not take a cost and it
+        does not take a classification: it takes a policy number, and works the
+        rest out again. There was no command for setting the classification by
+        hand, and I have not invented one.
+        -- dyloo35
+        """
+        if rev < MIN_DANGER:
+            self.send("502 NOT IMPLEMENTED")
+            return
+        if len(parts) != 3:
+            self.send("501 SYNTAX")
+            return
+        sid, number = parts[1], parts[2].upper()
+        if not POLICY_RE.match(number):
+            self.send("552 POLICY NUMBER MALFORMED")
+            return
+
+        with _lock:
+            target = None
+            for row in data["subjects"]:
+                if row.get("id") == sid:
+                    target = row
+                if row.get("policy") == number and row.get("id") != sid:
+                    self.send("553 POLICY ALREADY ALLOCATED")
+                    return
+            for row in data["claims"]:
+                if row.get("policy") == number:
+                    self.send("553 POLICY ALREADY ALLOCATED")
+                    return
+            if target is None:
+                self.send("404 NO SUCH RECORD")
+                return
+            if target.get("policy"):
+                self.send("554 POLICY ALREADY IN FORCE")
+                return
+            if target.get("outcome"):
+                self.send("555 FILE CLOSED")
+                return
+            target["policy"] = number
+            try:
+                save(data, creds)
+            except Exception:
+                target["policy"] = ""
+                self.send("451 REGISTER NOT WRITTEN")
+                return
+
+        row = view(target, data["criteria"])
+        self.send("250 RECORD")
+        for k, v in sorted(row.items()):
+            self.send("%s\t%s" % (k, v))
         self.send(".")
 
     def do_get(self, parts, rev, data):
@@ -205,8 +307,9 @@ class Handler(socketserver.StreamRequestHandler):
             self.send("501 SYNTAX")
             return
         ref = parts[1]
-        for row in data["claims"] + data["subjects"]:
-            if row.get("ref") == ref or row.get("id") == ref:
+        for raw in data["claims"] + data["subjects"]:
+            if raw.get("ref") == ref or raw.get("id") == ref:
+                row = view(raw, data["criteria"])
                 if "danger" in row and rev < MIN_DANGER:
                     row = {k: v for k, v in row.items() if k != "danger"}
                 self.send("250 RECORD")
@@ -215,6 +318,19 @@ class Handler(socketserver.StreamRequestHandler):
                 self.send(".")
                 return
         self.send("404 NO SUCH RECORD")
+
+
+POLICY_RE = re.compile(r"^ALD-[A-H]-\d{5}$")
+
+
+def save(data, creds):
+    """Re-seal the register. Same key, same file, written whole."""
+    blob = seal(json.dumps(data, sort_keys=True,
+                           separators=(",", ":")).encode(), derive(*creds))
+    tmp = ARCHIVE + ".tmp"
+    with open(tmp, "wb") as h:
+        h.write(blob)
+    os.replace(tmp, ARCHIVE)
 
 
 def listen(factory, port, label):
